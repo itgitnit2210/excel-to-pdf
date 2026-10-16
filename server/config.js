@@ -6,7 +6,7 @@ export const root = path.resolve(
   '..'
 );
 
-const maxUploadMb = Number(process.env.MAX_UPLOAD_MB || 25);
+const maxUploadMb = Number(process.env.MAX_UPLOAD_MB || 10);
 
 if (!Number.isFinite(maxUploadMb) || maxUploadMb <= 0) {
   throw new Error('MAX_UPLOAD_MB must be a positive number.');

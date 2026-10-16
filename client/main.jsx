@@ -7,27 +7,64 @@ function App() {
   const [busy, setBusy] = useState(false), [pdf, setPdf] = useState(''), [report, setReport] = useState(null), [drag, setDrag] = useState(false);
   const [mode, setMode] = useState('whole-sheet'), [password, setPassword] = useState('');
   const input = useRef();
+  const [accessKey, setAccessKey] = useState('');
+  const uploadLimit = health?.maxUploadMB || 10;
   useEffect(() => { fetch('/api/health').then(r => r.json()).then(setHealth).catch(() => setError('Cannot reach the server. Check that the Node.js backend is running.')); }, []);
   useEffect(() => () => { if (pdf) URL.revokeObjectURL(pdf); }, [pdf]);
   function select(next) {
     if (busy || !next) return;
     setPdf(''); setReport(null); setError(''); setFile(null); setPassword('');
     if (!/\.(xlsx|xlsm|xls)$/i.test(next.name)) return setError('Choose an .xlsx, .xlsm, or .xls file.');
-    if (next.size > 25 * 1024 * 1024) return setError('Maximum upload size is 25 MB.');
+    if (next.size > uploadLimit * 1024 * 1024) return setError(`Maximum upload size is ${uploadLimit} MB.`);
     if (/\.xls$/i.test(next.name)) setMode('original');
     setFile(next);
   }
+  async function jsonResponse(response) {
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(data.error || `Request failed (${response.status}). Please retry.`);
+    return data;
+  }
   async function generate() {
     setBusy(true); setError(''); setPdf(''); setReport(null);
+    let jobToken;
+    const workbookPassword = password;
+    setPassword('');
     try {
-      const body = new FormData(); body.append('file', file); body.append('mode', mode); body.append('password', password); setPassword('');
-      const response = await fetch('/api/convert', { method: 'POST', body });
-      if (!response.ok) { const detail = await response.json().catch(() => ({})); throw new Error(detail.error || 'Conversion failed. Please try again.'); }
-      const encoded = response.headers.get('X-Workbook-Report');
-      const blob = await response.blob();
-      setPdf(URL.createObjectURL(blob));
-      if (encoded) setReport(JSON.parse(new TextDecoder().decode(Uint8Array.from(atob(encoded), c => c.charCodeAt(0)))));
-    } catch (e) { setError(e.message); } finally { setBusy(false); }
+      if (health.uploadMode === 'blob') {
+        const prepared = await jsonResponse(await fetch('/api/upload/prepare', {
+          method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Upload-Key': accessKey },
+          body: JSON.stringify({ name: file.name, size: file.size })
+        }));
+        jobToken = prepared.jobToken;
+        const uploaded = await fetch(prepared.uploadUrl, { method: 'PUT', headers: { 'Content-Type': 'application/octet-stream' }, body: file });
+        if (!uploaded.ok) throw new Error(`Private upload failed (${uploaded.status}). Check the Blob store configuration.`);
+        const result = await jsonResponse(await fetch('/api/convert', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ jobToken, mode, password: workbookPassword })
+        }));
+        const downloaded = await fetch(result.downloadUrl);
+        if (!downloaded.ok) throw new Error('PDF download failed. Please convert the file again.');
+        const blob = await downloaded.blob();
+        setPdf(URL.createObjectURL(blob)); setReport(result.report);
+      } else {
+        const body = new FormData(); body.append('file', file); body.append('mode', mode); body.append('password', workbookPassword);
+        const response = await fetch('/api/convert', { method: 'POST', body });
+        if (!response.ok) await jsonResponse(response);
+        const encoded = response.headers.get('X-Workbook-Report');
+        setPdf(URL.createObjectURL(await response.blob()));
+        if (encoded) setReport(JSON.parse(new TextDecoder().decode(Uint8Array.from(atob(encoded), c => c.charCodeAt(0)))));
+      }
+    } catch (e) {
+      setError(e.message === 'Failed to fetch' ? 'The upload, conversion, or download connection failed. Check Vercel logs and your network, then retry.' : e.message);
+    } finally {
+      if (jobToken) {
+        try {
+          const cleaned = await fetch('/api/upload/cleanup', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ jobToken }) });
+          if (!cleaned.ok) setError(previous => previous || 'Temporary storage cleanup is pending; scheduled cleanup will retry.');
+        } catch { setError(previous => previous || 'Temporary storage cleanup is pending; scheduled cleanup will retry.'); }
+      }
+      setBusy(false);
+    }
   }
   return <ThemeProvider theme={theme}><CssBaseline />
     <Container maxWidth="lg" sx={{ py: { xs: 3, md: 6 } }}>
@@ -40,7 +77,7 @@ function App() {
           <Stack direction="row" spacing={1} alignItems="center" sx={{ mb: 3 }}><Chip label="01" size="small" /><Typography variant="h6">Choose your workbook</Typography></Stack>
           <Box onDragOver={e => { e.preventDefault(); if (!busy) setDrag(true); }} onDragLeave={() => setDrag(false)} onDrop={e => { e.preventDefault(); setDrag(false); select(e.dataTransfer.files[0]); }} sx={{ border: '2px dashed', borderColor: drag ? 'primary.main' : '#c8d4cc', bgcolor: drag ? '#edf8f0' : '#fafcf9', borderRadius: 3, p: 4, textAlign: 'center' }}>
             <Typography fontSize={36} color="primary">▦</Typography><Typography fontWeight={700} sx={{ overflowWrap: 'anywhere', mb: 1 }}>{file ? file.name : 'Drop your Excel file here'}</Typography>
-            <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>{file ? `${(file.size / 1024 / 1024).toFixed(2)} MB` : 'XLSX, XLSM or XLS · Up to 25 MB'}</Typography>
+            <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>{file ? `${(file.size / 1024 / 1024).toFixed(2)} MB` : `XLSX, XLSM or XLS · Up to ${uploadLimit} MB`}</Typography>
             <input ref={input} type="file" accept=".xlsx,.xlsm,.xls" aria-label="Upload Excel workbook" hidden onChange={e => { select(e.target.files[0]); e.target.value = ''; }} />
             <Button variant="outlined" disabled={busy} onClick={() => input.current.click()}>{file ? 'Change file' : 'Browse files'}</Button>
           </Box>
@@ -49,8 +86,9 @@ function App() {
             <MenuItem value="original">Original print settings</MenuItem>
           </TextField>
           <Typography variant="body2" color="text.secondary" sx={{ mt: 1 }}>{mode === 'whole-sheet' ? 'One content-sized page per visible sheet. Print areas and page breaks are ignored. Large sheets may need zooming.' : 'Uses saved paper size, scaling and print areas. Wide sheets may span several pages.'}</Typography>
+          {health?.uploadMode === 'blob' && <TextField fullWidth type="password" label="Upload access code" value={accessKey} disabled={busy} onChange={e => setAccessKey(e.target.value)} autoComplete="off" helperText="The app owner’s access code, separate from the workbook password." sx={{ mt: 3 }} />}
           <TextField fullWidth type="password" label="Workbook password (if required to open)" value={password} disabled={busy} onChange={e => setPassword(e.target.value)} autoComplete="off" helperText="Used only for this conversion and cleared when submitted. The downloaded PDF has no password." sx={{ mt: 3 }} />
-          <Button fullWidth size="large" variant="contained" disabled={!file || busy || !health?.available} onClick={generate} sx={{ mt: 3, py: 1.5 }}>{busy ? 'Converting workbook…' : 'Generate PDF'}</Button>
+          <Button fullWidth size="large" variant="contained" disabled={!file || busy || !health?.available || (health.uploadMode === 'blob' && !accessKey)} onClick={generate} sx={{ mt: 3, py: 1.5 }}>{busy ? 'Converting workbook…' : 'Generate PDF'}</Button>
           {busy && <Box role="status" sx={{ mt: 2 }}><LinearProgress /><Typography variant="body2" sx={{ mt: 1 }}>Rendering with LibreOffice. Large files may take up to two minutes.</Typography></Box>}
           {!health && !error && <Typography variant="body2" sx={{ mt: 2 }}><CircularProgress size={12} /> Checking conversion engine…</Typography>}
           {health && <Alert severity={health.available ? 'success' : 'warning'} sx={{ mt: 2 }}>{health.available ? 'Conversion engine ready' : health.message}</Alert>}
@@ -62,7 +100,7 @@ function App() {
           <Divider sx={{ my: 3 }} />
           <Typography fontWeight={700}>Before you convert</Typography>
           <Box component="ul" sx={{ pl: 2.5, color: 'text.secondary', '& li': { mb: 1.5 } }}><li>Check Print Preview in Excel.</li><li>Install the original fonts on the conversion machine.</li><li>Refresh formulas and linked data, then save.</li><li>Review charts, merged cells and long text in the PDF.</li></Box>
-          <Alert severity="info">Exact preservation is not guaranteed. Existing cell clipping can remain. Hidden sheets are excluded in whole-sheet mode. Files are deleted from server temporary storage after processing; the preview stays in this browser tab.</Alert>
+          <Alert severity="info">Exact preservation is not guaranteed. Existing cell clipping can remain. Hidden sheets are excluded in whole-sheet mode. Server temporary files are removed after processing. Private uploads and PDFs are deleted after download; interrupted jobs are removed by daily cleanup. The preview stays in this browser tab.</Alert>
         </Paper>
       </Box>
       {pdf && <Paper variant="outlined" sx={{ p: { xs: 2, md: 3 }, mt: 3 }}>
