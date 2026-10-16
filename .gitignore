@@ -1,0 +1,28 @@
+# Dependencies
+node_modules/
+frontend/package-lock.json
+package-lock.json
+
+# Production
+build/
+
+# Environment variables
+.env
+.env.*
+!.env.example
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Misc
+.cache/
+temp/
+tmp/
